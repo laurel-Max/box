@@ -1794,18 +1794,29 @@ function notifyStale(){
    云同步：GitHub 私有仓库存档（全自动）
    数据存进用户自己名下的 sync-attic 私仓，钥匙只存本机
    ============================================================ */
-let cloudBusy=false,cloudAutoT=null;
+let cloudBusy=false,cloudAutoT=null,cloudLastErr=0;
 const cloudCfg=()=>{try{return JSON.parse(localStorage.getItem('starbox_cloud')||'null')}catch(e){return null}};
 const cloudSaveCfg=c=>localStorage.setItem('starbox_cloud',JSON.stringify(c));
 const cloudDirty=()=>+(localStorage.getItem('starbox_dirty')||0);
 const cloudSlug=n=>((n||'box').toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g,'-').replace(/^-+|-+$/g,''))||'box';
 const cloudPath=()=>'boxes/'+cloudSlug(cloudCfg().name)+'.json';
+const cloudEnc=o=>btoa(unescape(encodeURIComponent(JSON.stringify(o))));
+function cloudDecodeFile(j){   /* Contents API 返回的是元数据，文件本体在 content(base64) 里 */
+  try{
+    if(!j)return null;
+    if(j.content&&j.encoding==='base64'){
+      const raw=atob(String(j.content).replace(/\s/g,''));
+      return JSON.parse(decodeURIComponent(escape(raw)));
+    }
+  }catch(e){}
+  return null;
+}
 
 function cloudTouch(){   /* 数据一变：记时间戳 + 安排 12 秒后自动上传 */
   localStorage.setItem('starbox_dirty',Date.now());
-  if(!cloudCfg())return;
+  if(!cloudCfg()||cloudBusy)return;
   clearTimeout(cloudAutoT);
-  cloudAutoT=setTimeout(()=>cloudPush(true),12000);
+  cloudAutoT=setTimeout(()=>cloudSync(true),12000);
 }
 function gh(path,method,body,raw){
   const c=cloudCfg();if(!c||!c.token)return Promise.reject(new Error('还没填 GitHub 钥匙'));
@@ -1813,6 +1824,10 @@ function gh(path,method,body,raw){
     headers:{Authorization:'token '+c.token,Accept:raw?'application/vnd.github.raw':'application/vnd.github+json','User-Agent':'starbox'},
     body:body?JSON.stringify(body):undefined})
     .then(r=>r.text().then(t=>({status:r.status,text:t})));
+}
+function cloudFail(msg){   /* 失败必须让人看见：静默模式下也弹，但 45 秒内只弹一次 */
+  const now=Date.now();
+  if(now-cloudLastErr>45000){cloudLastErr=now;toast('云同步：'+msg)}
 }
 async function cloudRepo(){   /* 确保私有仓库存档在（首次自动创建） */
   const c=cloudCfg();
@@ -1824,50 +1839,65 @@ async function cloudRepo(){   /* 确保私有仓库存档在（首次自动创�
   }
   throw new Error('GitHub 仓库创建失败（'+r.status+'），检查钥匙权限');
 }
-async function cloudPush(silent){
-  const c=cloudCfg();if(!c||cloudBusy)return;
-  cloudBusy=true;
-  try{
-    await cloudRepo();
-    const path=cloudPath();
-    const old=await gh('/repos/'+c.user+'/sync-attic/contents/'+path);
-    const body={message:'灵感星盒存档',
-      content:btoa(unescape(encodeURIComponent(JSON.stringify({v:1,savedAt:Date.now(),ideas:IDEAS}))))};
-    if(old.status===200)body.sha=JSON.parse(old.text).sha;
-    const r=await gh('/repos/'+c.user+'/sync-attic/contents/'+path,'PUT',body);
-    if(r.status===200||r.status===201){c.lastPushed=Date.now();cloudSaveCfg(c);if(!silent)toast('已上传云端')}
-    else if(!silent)toast('上传失败（'+r.status+'）');
-  }catch(e){if(!silent)toast('上传失败：'+e.message)}
-  cloudBusy=false;
+async function applyRemote(remote){   /* 云端合并进本地：同一条目取 updated 更新的那个 */
+  let n=0;
+  for(const ro of remote){
+    if(!ro||!ro.id)continue;
+    ro.tasks=ro.tasks||[];ro.imgs=ro.imgs||[];ro.tags=ro.tags||[];
+    const i=IDEAS.findIndex(x=>x.id===ro.id);
+    if(i<0){IDEAS.push(ro);await putIdea(ro);n++;continue}
+    const lo=IDEAS[i];
+    if((ro.updated||ro.created||0)>(lo.updated||lo.created||0)){IDEAS[i]=ro;await putIdea(ro);n++}
+  }
+  if(n)refresh();
+  return n;
 }
-async function cloudPull(silent){
+/* 双向同步：拉云端→合并→本地有云端没有的内容才上传。
+   天然保证「空盒子永远不会盖掉有内容的云端」。 */
+async function cloudSync(opts){
+  const quiet=opts&&opts.quiet;
   const c=cloudCfg();if(!c||cloudBusy)return;
   cloudBusy=true;
   try{
     await cloudRepo();
-    const r=await gh('/repos/'+c.user+'/sync-attic/contents/'+cloudPath(),null,null,true);
-    if(r.status!==200){if(!silent)toast('云端还没有这份存档');cloudBusy=false;return}
-    const data=JSON.parse(r.text);
-    if(data&&data.ideas){
-      await mergeIdeas(data.ideas);
-      c.lastPushed=Date.now();cloudSaveCfg(c);
-      if(!silent)toast('已从云端取回 '+data.ideas.length+' 条');
-      cloudStat();
+    const path='/repos/'+c.user+'/sync-attic/contents/'+cloudPath();
+    const gr=await gh(path);
+    let remote=null,sha=null;
+    if(gr.status===200){
+      const j=JSON.parse(gr.text);sha=j.sha;
+      const d=cloudDecodeFile(j);
+      if(d)remote=d.ideas||[];
+      else{   /* 文件超过 1MB 时 API 不返回 content，改走 raw */
+        const rr=await gh(path,null,null,true);
+        if(rr.status===200)remote=(JSON.parse(rr.text).ideas)||[];
+      }
     }
-  }catch(e){if(!silent)toast('下载失败：'+e.message)}
+    else if(gr.status!==404)throw new Error('读取存档失败（'+gr.status+'）');
+    let pulled=0,ahead=0;
+    if(remote){
+      /* 先算本地领先多少（本地新增的 / 本地改得更新的） */
+      for(const ro of remote){
+        if(!ro||!ro.id)continue;
+        const lo=IDEAS.find(x=>x.id===ro.id);
+        if(!lo){ahead++;continue}
+        if((lo.updated||lo.created||0)>(ro.updated||ro.created||0))ahead++;
+      }
+      pulled=await applyRemote(remote);
+    }
+    if(!remote||ahead>0){   /* 云端还没有存档，或本地有独有/更新内容 → 上传合并结果 */
+      const body={message:'灵感星盒存档',content:cloudEnc({v:1,savedAt:Date.now(),ideas:IDEAS})};
+      if(sha)body.sha=sha;
+      const wr=await gh(path,'PUT',body);
+      if(wr.status!==200&&wr.status!==201)throw new Error('上传失败（'+wr.status+'）');
+    }
+    c.lastPushed=Date.now();c.lastSync=c.lastPushed;cloudSaveCfg(c);
+    localStorage.setItem('starbox_dirty',String(c.lastPushed));
+    if(!quiet)toast(pulled||ahead?('同步完成：取回 '+pulled+' 条 · 上传 '+ahead+' 条'):'云端已是最新的');
+    else if(pulled)toast('已同步云端存档');
+  }catch(e){cloudFail(e.message)}
   cloudBusy=false;
 }
-async function cloudOpen(){   /* 打开应用：云端更新→拉；本地更新→推 */
-  const c=cloudCfg();if(!c)return;
-  try{
-    await cloudRepo();
-    const r=await gh('/repos/'+c.user+'/sync-attic/contents/'+cloudPath(),null,null,true);
-    const remote=r.status===200?(JSON.parse(r.text).savedAt||0):0;
-    const dirty=cloudDirty(),pushed=c.lastPushed||0;
-    if(remote>pushed&&remote>=dirty){await cloudPull(true);toast('已同步云端存档')}
-    else if(dirty>remote){cloudPush(true)}
-  }catch(e){}
-}
+function cloudOpen(){cloudSync({quiet:true})}
 async function cloudConnect(){
   const token=($('#clToken')||{}).value||'', name=($('#clName')||{}).value||'';
   if(!token.trim()){toast('先粘贴 GitHub 钥匙');return}
@@ -1877,24 +1907,32 @@ async function cloudConnect(){
   if(!u.login){toast('钥匙无效或过期，重新生成一个试试');return}
   cloudSaveCfg({token:token.trim(),name:name.trim(),user:u.login,lastPushed:0});
   $('#clToken').value='';
-  /* 新设备第一次连：若云端已有存档且本机基本是空的，直接拉；否则推上去 */
-  try{
-    await cloudRepo();
-    const r=await gh('/repos/'+u.login+'/sync-attic/contents/'+cloudPath(),null,null,true);
-    if(r.status===200){
-      const remote=JSON.parse(r.text).savedAt||0;
-      if(IDEAS.length===0||remote>cloudDirty()){
-        await cloudPull(true);toast('已连上，取回云端存档');cloudStat();return;
-      }
-      if(remote>0&&!confirm('云端存档更新于 '+fmtT(remote)+'，本机也有内容。\n确定=用云端合并本机，取消=把本机推上云？')){
-        await cloudPush(true);toast('已把本机推上云');cloudStat();return;
-      }
-    }
-  }catch(e){}
-  await cloudPull(true);
-  if(IDEAS.length===0)await cloudPush(true);
-  toast('云同步已开启');cloudStat();
+  await cloudSync(false);   /* 双向合并：空机拉满、有内容推上去，都不丢 */
 }
+/* 页面被切走/关掉时，把没来得及上传的改动立刻推出去（keepalive 让请求活过页面关闭） */
+async function cloudFlush(){
+  const c=cloudCfg();if(!c||cloudBusy)return;
+  if(!(cloudDirty()>(c.lastPushed||0)))return;
+  cloudBusy=true;
+  try{
+    const H={Authorization:'token '+c.token,Accept:'application/vnd.github+json','User-Agent':'starbox'};
+    const url='https://api.github.com/repos/'+c.user+'/sync-attic/contents/'+cloudPath();
+    const gr=await fetch(url,{headers:H,keepalive:true}).then(r=>r.json());
+    /* 云端比本地新就不推，防止盖掉别的设备的更新 */
+    let remoteNewer=false;
+    const rd=cloudDecodeFile(gr);
+    if(rd)remoteNewer=(rd.savedAt||0)>cloudDirty();
+    if(!remoteNewer){
+      const body={message:'灵感星盒存档',content:cloudEnc({v:1,savedAt:Date.now(),ideas:IDEAS})};
+      if(gr&&gr.sha)body.sha=gr.sha;
+      await fetch(url,{method:'PUT',headers:H,body:JSON.stringify(body),keepalive:true});
+    }
+    c.lastPushed=Date.now();cloudSaveCfg(c);
+  }catch(e){}
+  cloudBusy=false;
+}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')cloudFlush()});
+window.addEventListener('pagehide',()=>cloudFlush());
 function cloudOff(){
   if(!confirm('断开本设备的云同步？云端存档保留，其他设备不受影响。'))return;
   localStorage.removeItem('starbox_cloud');
@@ -1904,8 +1942,9 @@ function cloudStat(){
   const el=$('#cloudStat');if(!el)return;
   const c=cloudCfg();
   if(!c){el.innerHTML='未开启。填好下面两项点「连接」即可，换设备会自动同步。';return}
-  const unsync=cloudDirty()>(c.lastPushed||0)?'<span style="color:#C4456B"> · 有改动待上传</span>':'';
-  el.innerHTML='<b>已连接「'+esc(c.name)+'」</b>'+unsync+'<br><span style="font-size:11px">存档存在 GitHub 私有仓库 sync-attic，只有你的钥匙能打开</span>';
+  const unsync=cloudDirty()>(c.lastPushed||0)?'<span style="color:#C4456B"> · 有改动待上传</span>':' · 已是最新';
+  const last=c.lastSync?fmtT(c.lastSync):'';
+  el.innerHTML='<b>已连接「'+esc(c.name)+'」</b>'+unsync+'<br><span style="font-size:11px">本机 '+IDEAS.length+' 条'+(last?' · 上次同步 '+last:'')+'<br>存档在 GitHub 私有仓库 sync-attic，只有你的钥匙能打开</span>';
 }
 
 /* ============================================================
@@ -1931,12 +1970,11 @@ function openSettings(){
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
       <button class="btn pri" onclick="cloudConnect()">连接 / 保存</button>
-      <button class="btn ghost" onclick="cloudPush()">上传</button>
-      <button class="btn ghost" onclick="cloudPull()">下载</button>
+      <button class="btn ghost" onclick="cloudSync()">立即同步</button>
       ${c?'<button class="btn ghost" style="color:#C4456B" onclick="cloudOff()">断开</button>':''}
     </div>
     <div class="dim" style="font-size:11.5px;margin-top:8px;line-height:1.7">
-      开启后：改动约 12 秒内自动上传；打开应用时若云端更新会自动取回。<br>
+      开启后：改动约 12 秒内自动上传，切走页面也会即时补推；打开应用时自动双向合并，谁的新听谁的。<br>
       换新设备：粘贴同一把钥匙 + 同一个存档名字，点「连接」就齐了。
     </div>
   </div>
